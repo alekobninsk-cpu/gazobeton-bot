@@ -1,6 +1,6 @@
 """
-Газобетон — Новостной дайджест бот (v3)
-Красивый формат с комментариями AI и трендом дня.
+Газобетон — Новостной дайджест бот (v4)
+Красивый формат с комментариями AI, трендом дня и статьёй для сайта.
 """
 
 import asyncio
@@ -46,6 +46,17 @@ KEYWORDS = [
     "малоэтажное", "загородный дом", "ипотека", "строительство дома",
 ]
 
+# Темы для статей — чередуются по дням недели
+ARTICLE_TOPICS = [
+    "Чем отличается газобетон D500 от D600: что выбрать для строительства дома",
+    "Как правильно укладывать газобетонные блоки: пошаговая инструкция",
+    "Сколько газобетонных блоков нужно на дом: расчёт на примере 10х10",
+    "Газобетон или кирпич: что выгоднее и лучше для загородного дома",
+    "Нужен ли армопояс при строительстве из газобетона и зачем",
+    "U-блоки для газобетона: что это такое и где применяются",
+    "Какой толщины стены из газобетона делать в Калужской области",
+]
+
 NUMBERS = ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
 DIVIDER = "─────────────────"
 
@@ -80,7 +91,7 @@ def entry_date(entry) -> datetime:
 async def fetch_feed(url: str) -> list:
     try:
         async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-            r = await client.get(url, headers={"User-Agent": "Mozilla/5.0 (compatible; GazobetonBot/3.0)"})
+            r = await client.get(url, headers={"User-Agent": "Mozilla/5.0 (compatible; GazobetonBot/4.0)"})
             r.raise_for_status()
         return feedparser.parse(r.text).entries
     except Exception as e:
@@ -166,6 +177,65 @@ def select_best_with_ai(candidates: list) -> list:
         relevant = [c for c in candidates if is_relevant(c)]
         return relevant[:5] if relevant else candidates[:3]
 
+def generate_site_article() -> str:
+    """Генерирует готовую статью для сайта через Claude."""
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    day_of_week = datetime.now().weekday()
+    topic = ARTICLE_TOPICS[day_of_week % len(ARTICLE_TOPICS)]
+    today = datetime.now().strftime("%d.%m.%Y")
+
+    prompt = f"""Ты эксперт по газобетонным блокам и SEO-копирайтер компании "Калужский газобетон" (kaluzhskiygazobeton.ru).
+
+Напиши полезную статью для сайта на тему: "{topic}"
+
+Требования:
+- Длина: 400-600 слов
+- Стиль: экспертный, дружелюбный, без воды
+- Упомяни компанию "Калужский газобетон" 1-2 раза естественно
+- Регионы: Калужская, Московская, Тульская область
+- В конце добавь призыв к действию — позвонить или оставить заявку
+
+Ответь строго в формате JSON:
+{{
+  "title": "заголовок статьи",
+  "text": "полный текст статьи",
+  "keys": "5-7 ключевых слов через запятую"
+}}"""
+
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=2000,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        raw = response.content[0].text.strip()
+        raw = raw.replace("```json", "").replace("```", "").strip()
+        data = json.loads(raw)
+
+        title = data.get("title", topic)
+        text = data.get("text", "")
+        keys = data.get("keys", "")
+
+        msg = (
+            f"📝 <b>СТАТЬЯ ДЛЯ САЙТА — {today}</b>\n"
+            f"{DIVIDER}\n\n"
+            f"<b>Заголовок:</b>\n{title}\n\n"
+            f"<b>Текст статьи:</b>\n{text}\n\n"
+            f"{DIVIDER}\n"
+            f"🔑 <b>Ключевые слова для SEO:</b>\n{keys}\n\n"
+            f"{DIVIDER}\n"
+            f"<b>Как разместить на сайте:</b>\n"
+            f"1. Мегагрупп → Страницы → Полезная информация\n"
+            f"2. Добавить статью → вставить заголовок и текст\n"
+            f"3. В поисковые теги вставить ключевые слова\n"
+            f"4. Опубликовать ✅"
+        )
+        return msg
+
+    except Exception as e:
+        log.error("Ошибка генерации статьи: %s", e)
+        return ""
+
 def clean(text: str) -> str:
     text = re.sub(r"<[^>]+>", "", text)
     text = text.replace("&amp;", "&").replace("&quot;", '"').replace("&lt;", "<").replace("&gt;", ">")
@@ -215,26 +285,38 @@ async def send_digest():
     seen = load_seen()
     candidates = await collect_candidates(seen)
     log.info("Кандидатов собрано: %d", len(candidates))
-    if not candidates:
-        log.info("Новых новостей нет.")
-        return
-    selected = select_best_with_ai(candidates)
-    log.info("Отобрано AI: %d новостей", len(selected))
-    if not selected:
-        log.info("AI не нашёл подходящих новостей.")
-        return
-    text = format_digest(selected)
     bot = Bot(token=TELEGRAM_TOKEN)
-    await bot.send_message(
-        chat_id=TELEGRAM_CHAT_ID,
-        text=text,
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
-    )
-    log.info("Дайджест отправлен! (%d новостей)", len(selected))
-    for item in selected:
-        seen.add(item["uid"])
-    save_seen(seen)
+
+    # 1. Отправляем дайджест новостей
+    if candidates:
+        selected = select_best_with_ai(candidates)
+        log.info("Отобрано AI: %d новостей", len(selected))
+        if selected:
+            text = format_digest(selected)
+            await bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            log.info("Дайджест отправлен! (%d новостей)", len(selected))
+            for item in selected:
+                seen.add(item["uid"])
+            save_seen(seen)
+    else:
+        log.info("Новых новостей нет — пропускаем дайджест.")
+
+    # 2. Отправляем статью для сайта
+    log.info("Генерирую статью для сайта…")
+    article = generate_site_article()
+    if article:
+        await bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=article,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        log.info("Статья для сайта отправлена!")
 
 async def main():
     log.info("Бот запускается. Дайджест каждый день в %02d:%02d МСК", DIGEST_HOUR, DIGEST_MINUTE)
