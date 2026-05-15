@@ -46,7 +46,6 @@ KEYWORDS = [
     "малоэтажное", "загородный дом", "ипотека", "строительство дома",
 ]
 
-# Темы для статей — чередуются по дням недели
 ARTICLE_TOPICS = [
     "Чем отличается газобетон D500 от D600: что выбрать для строительства дома",
     "Как правильно укладывать газобетонные блоки: пошаговая инструкция",
@@ -59,6 +58,8 @@ ARTICLE_TOPICS = [
 
 NUMBERS = ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
 DIVIDER = "─────────────────"
+MAX_MSG = 4000
+
 
 def load_seen() -> set:
     if os.path.exists(SEEN_FILE):
@@ -178,7 +179,6 @@ def select_best_with_ai(candidates: list) -> list:
         return relevant[:5] if relevant else candidates[:3]
 
 def generate_site_article() -> str:
-    """Генерирует готовую статью для сайта через Claude."""
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     day_of_week = datetime.now().weekday()
     topic = ARTICLE_TOPICS[day_of_week % len(ARTICLE_TOPICS)]
@@ -256,29 +256,67 @@ def get_source(url: str) -> str:
         return domain
     return "источник"
 
-def format_digest(items: list) -> str:
+def format_digest_parts(items: list) -> list:
+    """Формирует список сообщений — каждое не более MAX_MSG символов."""
     today = datetime.now().strftime("%d.%m.%Y")
     trend = items[0].get("_trend", "") if items else ""
-    parts = [
-        "🧱 <b>ГАЗОБЕТОННЫЙ ДАЙДЖЕСТ</b>",
-        today,
-        DIVIDER,
-    ]
+
+    header = f"🧱 <b>ГАЗОБЕТОННЫЙ ДАЙДЖЕСТ</b>\n{today}\n{DIVIDER}\n"
+    messages = []
+    current = header
+
     for i, item in enumerate(items):
         title   = clean(item.get("title", "Без заголовка"))
         link    = safe_link(item.get("link", ""))
         comment = clean(item.get("comment", ""))
         source  = get_source(link)
         num     = NUMBERS[i] if i < len(NUMBERS) else f"{i+1}."
-        parts.append(f"{num} <b>{title}</b>")
+
+        block = f"{num} <b>{title}</b>\n"
         if comment:
-            parts.append(comment)
+            block += f"{comment}\n"
         if link.startswith("http"):
-            parts.append(f"🔗 {source} ({link})")
-        parts.append(DIVIDER)
+            block += f"🔗 {source} ({link})\n"
+        block += f"{DIVIDER}\n"
+
+        if len(current) + len(block) > MAX_MSG:
+            messages.append(current)
+            current = block
+        else:
+            current += block
+
     if trend:
-        parts.append(f"📌 <b>Тренд дня:</b> {clean(trend)}")
-    return "\n".join(parts)
+        footer = f"📌 <b>Тренд дня:</b> {clean(trend)}"
+        if len(current) + len(footer) > MAX_MSG:
+            messages.append(current)
+            messages.append(footer)
+        else:
+            current += footer
+
+    if current:
+        messages.append(current)
+
+    return messages
+
+async def send_long_message(bot: Bot, chat_id: str, text: str) -> None:
+    """Отправляет длинное сообщение частями по MAX_MSG символов."""
+    if len(text) <= MAX_MSG:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    else:
+        parts = [text[i:i+MAX_MSG] for i in range(0, len(text), MAX_MSG)]
+        for part in parts:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=part,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            await asyncio.sleep(0.5)
 
 async def send_digest():
     log.info("Запускаю сборку дайджеста…")
@@ -292,13 +330,15 @@ async def send_digest():
         selected = select_best_with_ai(candidates)
         log.info("Отобрано AI: %d новостей", len(selected))
         if selected:
-            text = format_digest(selected)
-            await bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=text,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
+            parts = format_digest_parts(selected)
+            for part in parts:
+                await bot.send_message(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    text=part,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+                await asyncio.sleep(0.5)
             log.info("Дайджест отправлен! (%d новостей)", len(selected))
             for item in selected:
                 seen.add(item["uid"])
@@ -310,12 +350,7 @@ async def send_digest():
     log.info("Генерирую статью для сайта…")
     article = generate_site_article()
     if article:
-        await bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text=article,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
+        await send_long_message(bot, TELEGRAM_CHAT_ID, article)
         log.info("Статья для сайта отправлена!")
 
 async def main():
